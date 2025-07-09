@@ -694,6 +694,8 @@ class CupHandleDetector:
                         'end_time': window.index[-1],
                         'strength': touches
                     })
+
+                    
         
         # Sort and store summary
         resistance_levels.sort(key=lambda x: x['strength'], reverse=True)
@@ -804,13 +806,9 @@ class CupHandleDetector:
     def find_breakout_after_handle(self, df, handle_end, resistance_level, peak_a_price, peak_c_price, peak_c_time):
         """Find breakout - Enhanced with detailed debugging"""
 
-        current_atr = self.calculate_atr(df, 20).iloc[-1]
-        primary_threshold = resistance_level + (current_atr * 0.25)
-        breakout_threshold = resistance_level + (current_atr * 0.25)
-        fallback_threshold = resistance_level * 1.002
-        breakout_threshold = min(primary_threshold, fallback_threshold)
-    
-    
+        rim_level = max(peak_a_price, peak_c_price)
+        breakout_threshold = rim_level
+
         # DEBUG: Log all inputs
         print(f"\n🔍 BREAKOUT DEBUG:")
         print(f"   handle_end: {handle_end}")
@@ -842,15 +840,7 @@ class CupHandleDetector:
         if search_bars <= 0:
             print(f"   ❌ No bars available for breakout search")
             return None
-        
-        # Define breakout criteria
-        rim_level = max(peak_a_price, peak_c_price)
-        current_atr = self.calculate_atr(df, 20).iloc[-1]
-        breakout_threshold = rim_level + (current_atr * 0.25) 
-    
-        
-        print(f"   Breakout threshold: ${breakout_threshold:.2f} (current_atr: ${current_atr:.2f})")
-        
+   
         # Search for breakout
         breakout_found = False
         breakout_time = None
@@ -925,6 +915,9 @@ class CupHandleDetector:
 
             handle_low_price = potential_handle['low'].min()
 
+            if handle_low_price >= peak_c_price:
+                continue
+
             # STEP 1: Handle must be below rim (fundamental requirement)
 
             actual_rim_level = resistance_level  # This is the real resistance level
@@ -968,9 +961,10 @@ class CupHandleDetector:
                 print(f"   ❌ Handle rejected: {depth_msg}")
                 continue
 
-
+            trough_b_price = df.loc[trough_b_time, 'low']
             pullback_depth = (actual_rim_level - handle_low_price) / actual_rim_level
-            min_pullback_points = 2.0  # Minimum 2 ES points below rim
+            cup_depth = peak_c_price - trough_b_price
+            min_pullback_points = max(0.25, cup_depth * 0.03)
             if (peak_c_price - handle_low_price) < min_pullback_points:
                 print(f"   ❌ Handle too close to rim: {peak_c_price - handle_low_price:.2f} points < {min_pullback_points}")
                 continue
@@ -1004,8 +998,7 @@ class CupHandleDetector:
                 if not is_valid_rim:
                     continue
 
-                trough_b_price = df.loc[trough_b_time, 'low']
-
+               
             
                 
                 handle_quality_score = self.score_handle_quality(potential_handle, peak_c_price, trough_b_price)
@@ -1056,7 +1049,7 @@ class CupHandleDetector:
         
         depth_ratio = handle_depth / cup_depth
         
-        if depth_ratio <= 0.15:
+        if depth_ratio <= 0.25:
             return True, "OPTIMAL"
         elif depth_ratio <= 0.70:
             return True, "ACCEPTABLE"
@@ -1291,7 +1284,7 @@ class CupHandleDetector:
             'peak_c': peak_c_time,
             'handle_d': handle['start'],
             'breakout_e': breakout_time,
-            'breakout_threshold': resistance['price'],
+            'breakout_threshold': max(peak_a_price, peak_c_price),
             'breakout_confirmed': True,
             'cup_depth': cup_depth,
             'cup_depth_pct': cup_depth_pct,
@@ -2768,6 +2761,13 @@ class CupHandleDetector:
 
                 if abs(peak_c_price - resistance['price']) / resistance['price'] > 0.05:
                      continue 
+                
+                rim_valid, rim_msg = self.validate_no_higher_highs_in_cup(
+                    df, peak_a_time, peak_c_time, tolerance_pct=2.0
+                )
+                if not rim_valid:
+                    print(f"         ❌ {rim_msg}")
+                    continue
 
                 trough_b_time = trough_b_idx     
                 handles = self.detect_handle_formation(df, resistance['price'], peak_c_time, peak_c_price, peak_a_time, trough_b_time)
