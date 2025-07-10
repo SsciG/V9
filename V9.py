@@ -27,23 +27,23 @@ class CupHandleDetector:
         self.config = {
             # Extrema detection parameters
             "window_sizes": [2, 3, 4, 5, 6, 7, 8],   
-            "prominence": 0.002,        
+            "prominence": 0.001,        
             "smooth_window": 1,           
             "smooth_poly": 1,            
             
             # Pattern geometry requirements
             "min_cup_depth": 0.0005,        
             "max_cup_depth": 1000,          
-            "cup_symmetry_threshold": 0.6, 
+            "cup_symmetry_threshold": 0.45, 
             "max_handle_drop": 0.5,      
             "min_handle_drop": 0.001,       
             "handle_position_min": 0.3,   
-             "min_cup_roundness": 0.7,
+             "min_cup_roundness": 0.5,
             # Duration constraints
-            "min_cup_duration": 60,        
+            "min_cup_duration": 30,        
             "max_cup_duration": 14400,      
             "min_handle_duration": 15,    
-            "max_handle_duration": 240,     
+            "max_handle_duration": 480,     
             "handle_to_cup_ratio_max": 0.9, 
             "rim_height_tolerance_pct": 0.05,
             # Quality scoring weights
@@ -765,6 +765,7 @@ class CupHandleDetector:
     
     def remove_duplicate_patterns(self, patterns):
         """Remove nearly identical patterns"""
+        print(f"🔄 DEDUP: Processing {len(patterns)} patterns")
         unique_patterns = []
         
         for pattern in patterns:
@@ -806,8 +807,11 @@ class CupHandleDetector:
     def find_breakout_after_handle(self, df, handle_end, resistance_level, peak_a_price, peak_c_price, peak_c_time):
         """Find breakout - Enhanced with detailed debugging"""
 
-        rim_level = max(peak_a_price, peak_c_price)
-        breakout_threshold = rim_level
+        current_atr = self.calculate_atr(df, 20).iloc[-1]  # You already have this method
+        breakout_threshold_min = peak_c_price + (current_atr * 0.5)
+        breakout_threshold_max = peak_c_price + (current_atr * 0.75)
+        print(f"   🔧 DEBUG: breakout_threshold initially set to ${breakout_threshold_min:.2f}")
+        
 
         # DEBUG: Log all inputs
         print(f"\n🔍 BREAKOUT DEBUG:")
@@ -846,25 +850,30 @@ class CupHandleDetector:
         breakout_time = None
         max_high_seen = 0
         
+        print(f"   🔧 DEBUG: breakout_threshold_min before search: ${breakout_threshold_min:.2f}")
+        print(f"   🔧 DEBUG: breakout_threshold_max before search: ${breakout_threshold_max:.2f}")
+        
         for i in range(search_start_idx, search_end_idx):
+            
             current_high = df.iloc[i]['high']
             max_high_seen = max(max_high_seen, current_high)
             
             # Simple breakout criteria: high >= threshold
-            if current_high >= breakout_threshold:
+            if breakout_threshold_min <= current_high <= breakout_threshold_max:
                 breakout_found = True
                 breakout_time = df.index[i]
-                print(f"   ✅ BREAKOUT FOUND at {breakout_time}: ${current_high:.2f} >= ${breakout_threshold:.2f}")
                 break
-        
+
+            print(f"   🔧 DEBUG: breakout_threshold_min before search: ${breakout_threshold_min:.2f}")
+                    
 
         # if max_high_seen > rim_level:
         #     print(f"   ❌ INVALIDATED: Price exceeded rim during search (${max_high_seen:.2f} > ${rim_level:.2f})")
         #     return None
         
         if not breakout_found:
-            print(f"   ❌ NO BREAKOUT: Max high seen ${max_high_seen:.2f} < threshold ${breakout_threshold:.2f}")
-            print(f"   📊 Gap to breakout: ${breakout_threshold - max_high_seen:.2f} points")
+            print(f"   ❌ NO BREAKOUT: Max high seen ${max_high_seen:.2f} < threshold ${breakout_threshold_min:.2f}")
+            print(f"   📊 Gap to breakout: ${breakout_threshold_min - max_high_seen:.2f} points")
             return None
         
         self.detection_stats['pattern_creation']['breakouts_found'] += 1
@@ -1310,6 +1319,37 @@ class CupHandleDetector:
         print(f"   ✅ PATTERN CREATED: Quality={quality_score:.1f}")
         return pattern
     
+    def is_significant_peak(self, df, peak_time, atr_multiplier=1.5):
+        """Check if peak is significant enough to be a rim (using ATR)"""
+        try:
+            # Get ATR at this point in time
+            atr_series = self.calculate_atr(df, 20)
+            peak_idx = df.index.get_loc(peak_time)
+            current_atr = atr_series.iloc[peak_idx] if peak_idx < len(atr_series) else atr_series.iloc[-1]
+            
+            # Get peak price and surrounding prices
+            peak_price = df.loc[peak_time, 'high']
+            
+            # Look at 5 bars before and after (or available range)
+            start_idx = max(0, peak_idx - 5)
+            end_idx = min(len(df), peak_idx + 6)
+            local_window = df.iloc[start_idx:end_idx]
+            
+            # Peak must exceed surrounding area by at least 1.5x ATR
+            min_surrounding = local_window['low'].min()
+            peak_prominence = peak_price - min_surrounding
+            required_prominence = current_atr * atr_multiplier
+            
+            is_significant = peak_prominence >= required_prominence
+            
+            print(f"    🔍 Peak {peak_time}: prominence={peak_prominence:.2f}, required={required_prominence:.2f}, significant={is_significant}")
+            
+            return is_significant
+            
+        except Exception as e:
+            print(f"    ⚠️ ATR significance check failed: {e}")
+            return True  # Default to accepting if check fails
+    
 
     def find_optimal_right_rim(self, df, accumulation_start, accumulation_end, resistance_level, left_rim_price, trough_time):
         """Find actual valid right rim - must be real peak at end of cup recovery"""
@@ -1337,11 +1377,23 @@ class CupHandleDetector:
                 print(f"      ❌ No actual peaks found in recovery phase, using accumulation_end")
                 return accumulation_end  # ← ALWAYS VALID FALLBACK
             
+            # Step 3: Filter for ATR-significant peaks only
+            significant_peaks = []
+            for peak_time, peak_row in actual_peaks.iterrows():
+                if self.is_significant_peak(df, peak_time, atr_multiplier=1.5):
+                    significant_peaks.append((peak_time, peak_row))
+            
+            if not significant_peaks:
+                print(f"      ❌ No ATR-significant peaks found, using best available")
+                significant_peaks = [(peak_time, peak_row) for peak_time, peak_row in actual_peaks.iterrows()]
+            
+            print(f"      📊 ATR Filter: {len(actual_peaks)} peaks → {len(significant_peaks)} significant")
+            
             # Step 3: Score peaks based on multiple criteria
             candidates = []
             for peak_time, peak_row in actual_peaks.iterrows():
                 peak_price = peak_row['high']
-                
+                total_score = 0 
                 # Price symmetry with left rim (40% weight)
                 price_diff_pct = abs(peak_price - left_rim_price) / left_rim_price * 100
                 symmetry_score = max(0, 100 - price_diff_pct * 40)
@@ -1364,9 +1416,9 @@ class CupHandleDetector:
                 
                 # Combined score
                     total_score = (
-                        0.6 * symmetry_score +      # INCREASED from 0.4 to 0.6
-                        0.2 * position_score +      # REDUCED from 0.3 to 0.2  
-                        0.2 * strength_score        # REDUCED from 0.3 to 0.2
+                        0.6 * symmetry_score +   
+                        0.2 * position_score +    
+                        0.2 * strength_score       
                     )
                 
                 candidates.append({
@@ -1829,6 +1881,51 @@ class CupHandleDetector:
         adjusted_config["rim_tolerance_base"] *= volatility_multiplier  # More tolerance in volatile markets
         
         return adjusted_config
+    
+
+    def find_best_left_rim(self, df, accumulation_start, resistance_level, max_search_bars=50):
+        """Find actual left rim peak, not just accumulation start"""
+        
+        try:
+            acc_start_idx = df.index.get_loc(accumulation_start)
+            search_start = max(0, acc_start_idx - max_search_bars)
+            search_end = acc_start_idx + 5  # Small buffer after accumulation start
+            
+            # Look for actual peaks in this window
+            search_window = df.iloc[search_start:search_end]
+            peaks = search_window[search_window['extrema'] == 1]
+            
+            print(f"    🔍 Left rim search: {len(peaks)} peaks found near accumulation start")
+            
+            if len(peaks) == 0:
+                print(f"    ⚠️ No peaks found, using accumulation start")
+                return accumulation_start, df.loc[accumulation_start, 'high']
+            
+            # Find peak closest to resistance level
+            best_peak = None
+            min_diff = float('inf')
+            
+            for peak_time, peak_row in peaks.iterrows():
+                peak_price = peak_row['high']
+                diff = abs(peak_price - resistance_level)
+                
+                # Also check if peak is reasonably close to resistance (within 5%)
+                if diff / resistance_level <= 0.05:
+                    if diff < min_diff:
+                        min_diff = diff
+                        best_peak = (peak_time, peak_price)
+                        print(f"    🎯 Better left rim candidate: {peak_time} at ${peak_price:.2f} (diff: ${diff:.2f})")
+            
+            if best_peak:
+                print(f"    ✅ Selected left rim: {best_peak[0]} at ${best_peak[1]:.2f}")
+                return best_peak[0], best_peak[1]
+            
+            print(f"    ⚠️ No suitable peaks found, using accumulation start")
+            return accumulation_start, df.loc[accumulation_start, 'high']
+            
+        except Exception as e:
+            print(f"    ❌ Left rim search failed: {e}, using accumulation start")
+            return accumulation_start, df.loc[accumulation_start, 'high']
  
 
 
@@ -2093,6 +2190,7 @@ class CupHandleDetector:
         # Store rejected pattern info for manual review
      
         patterns, rejection_stats = self.detect_cup_and_handle(processed_df, 'extrema', f"{price_col}_smooth")
+        patterns = self.remove_duplicate_patterns(patterns)
         print(f"\n🚨 PATTERN FLOW DEBUG:")
         print(f"   Patterns returned from detect_cup_and_handle: {len(patterns)}")
         if patterns:
@@ -2105,20 +2203,7 @@ class CupHandleDetector:
         logger.info("Filtering high-quality patterns")
         filtered_patterns = self.filter_patterns(patterns)
         logger.info("Fine-tuning patterns for optimal rim heights")
-        
-        # adjusted_patterns = []
-        # print(f"🔍 STARTING RIM ADJUSTMENT: {len(filtered_patterns)} patterns to process")
-        # for i, pattern in enumerate(filtered_patterns):
-        #     print(f"🔍 Processing pattern {i+1}/{len(filtered_patterns)}: A={pattern['peak_a']}, C={pattern['peak_c']}")
-        #     adjusted_pattern = self.adjust_pattern_points(pattern, processed_df, f"{price_col}_smooth")
-        #     if adjusted_pattern is not None:
-        #         adjusted_patterns.append(adjusted_pattern)
-        #     else:
-        #         logger.info(f"Skipped pattern during rim adjustment (validation failed)")
-
-        # # Move this OUTSIDE the loop
-        # filtered_patterns = adjusted_patterns
-        # logger.info(f"After rim adjustment: {len(filtered_patterns)} patterns remain")
+     
         if self.config.get('skip_rim_adjustment', False):
          logger.info(f"Skipping rim adjustment - using original {len(filtered_patterns)} patterns")
 
@@ -2621,16 +2706,7 @@ class CupHandleDetector:
             "rejection_stats": rejection_stats,
             "processed_df": processed_df
         }
-    
-    def __init___with_deduplication_fix(self, config=None):
-        """Enhanced __init__ with deduplication tracking"""
-        # Call original __init__ logic here (your existing config setup)
-        
-        # Add pattern tracking for deduplication
-        self._created_patterns = set()
-        self._pattern_fingerprints = {}
-        
-        print("🔧 STEP 2: Deduplication tracking initialized")
+
     
     def detect_cup_and_handle_deduped(self, df, extrema_col='extrema', price_col='close_smooth'):
         """
@@ -2660,6 +2736,7 @@ class CupHandleDetector:
         if not resistance_levels:
             rejection_reasons['no_resistance_levels'] = 1
             self.print_detection_summary()
+            patterns = self.remove_duplicate_patterns(patterns)
             return patterns, rejection_reasons
         
         print(f"   📊 Found {len(resistance_levels)} resistance levels")
@@ -2721,32 +2798,25 @@ class CupHandleDetector:
                 left_peaks = left_peaks[left_peaks['extrema'] == 1]
 
                 if len(left_peaks) > 0:
-                    # Find peak closest to resistance level
-                    best_left_rim = None
-                    min_diff = float('inf')
-                    
-                    for peak_time, peak_row in left_peaks.iterrows():
-                        diff = abs(peak_row['high'] - resistance['price'])
-                        if diff < min_diff:
-                            min_diff = diff
-                            best_left_rim = peak_row['high']
-                            best_left_rim_time = peak_time
-                    
-                    if best_left_rim is not None:
-                        peak_a_price = best_left_rim
-                        peak_a_time = best_left_rim_time
-                        peak_c_time = self.find_optimal_right_rim(
-                            df,
-                            accumulation['start'],
-                            accumulation['end'],
-                            resistance['price'],    # resistance_level
-                            best_left_rim,          # left_rim_price
-                            trough_b_idx            # trough_time
-                        )
-                    else:
-                        continue  # Skip this accumulation if no left rim found
+                    # Use new method to find better left rim
+                    peak_a_time, peak_a_price = self.find_best_left_rim(
+                        df, accumulation['start'], resistance['price']
+                    )
                 else:
-                    continue  # Skip this accumulation if no left rim found
+                    # Fallback to accumulation start if no peaks found
+                    peak_a_time = accumulation['start']
+                    peak_a_price = df.loc[accumulation['start'], 'high']
+                    print(f"         ⚠️ No left peaks found, using accumulation start")
+
+                peak_c_time = self.find_optimal_right_rim(
+                    df,
+                    accumulation['start'],
+                    accumulation['end'],
+                    resistance['price'],    # resistance_level
+                    peak_a_price,          # left_rim_price - FIXED!
+                    trough_b_idx           # trough_time
+                )
+
 
 
                 if peak_c_time is None or pd.isna(peak_c_time):
@@ -3281,10 +3351,11 @@ if __name__ == "__main__":
     custom_config = {
     # Ultra-relaxed detection
     "rim_height_tolerance_pct": 1.0,
-    "min_cup_roundness": 0.1,
+    "min_cup_roundness": 0.3,
     "min_cup_symmetry": 0.15,
     "min_quality_score": 55,
     "min_cup_depth": 0.003,
+    "breakout_max_above_rim_pct": 0.5,
     "disable_deduplication": True,
     "min_handle_gap_minutes": 150, 
     "max_handle_depth_pct": 25.0,  # Keep existing max
