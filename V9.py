@@ -1416,9 +1416,9 @@ class CupHandleDetector:
                 
                 # Combined score
                     total_score = (
-                        0.6 * symmetry_score +   
-                        0.2 * position_score +    
-                        0.2 * strength_score       
+                        0.8 * symmetry_score +   
+                        0.1 * position_score +    
+                        0.1 * strength_score       
                     )
                 
                 candidates.append({
@@ -2706,7 +2706,16 @@ class CupHandleDetector:
             "rejection_stats": rejection_stats,
             "processed_df": processed_df
         }
-
+    
+    def __init___with_deduplication_fix(self, config=None):
+        """Enhanced __init__ with deduplication tracking"""
+        # Call original __init__ logic here (your existing config setup)
+        
+        # Add pattern tracking for deduplication
+        self._created_patterns = set()
+        self._pattern_fingerprints = {}
+        
+        print("🔧 STEP 2: Deduplication tracking initialized")
     
     def detect_cup_and_handle_deduped(self, df, extrema_col='extrema', price_col='close_smooth'):
         """
@@ -2798,25 +2807,32 @@ class CupHandleDetector:
                 left_peaks = left_peaks[left_peaks['extrema'] == 1]
 
                 if len(left_peaks) > 0:
-                    # Use new method to find better left rim
-                    peak_a_time, peak_a_price = self.find_best_left_rim(
-                        df, accumulation['start'], resistance['price']
-                    )
+                    # Find peak closest to resistance level
+                    best_left_rim = None
+                    min_diff = float('inf')
+                    
+                    for peak_time, peak_row in left_peaks.iterrows():
+                        diff = abs(peak_row['high'] - resistance['price'])
+                        if diff < min_diff:
+                            min_diff = diff
+                            best_left_rim = peak_row['high']
+                            best_left_rim_time = peak_time
+                    
+                    if best_left_rim is not None:
+                        peak_a_price = best_left_rim
+                        peak_a_time = best_left_rim_time
+                        peak_c_time = self.find_optimal_right_rim(
+                            df,
+                            accumulation['start'],
+                            accumulation['end'],
+                            resistance['price'],    # resistance_level
+                            best_left_rim,          # left_rim_price
+                            trough_b_idx            # trough_time
+                        )
+                    else:
+                        continue  # Skip this accumulation if no left rim found
                 else:
-                    # Fallback to accumulation start if no peaks found
-                    peak_a_time = accumulation['start']
-                    peak_a_price = df.loc[accumulation['start'], 'high']
-                    print(f"         ⚠️ No left peaks found, using accumulation start")
-
-                peak_c_time = self.find_optimal_right_rim(
-                    df,
-                    accumulation['start'],
-                    accumulation['end'],
-                    resistance['price'],    # resistance_level
-                    peak_a_price,          # left_rim_price - FIXED!
-                    trough_b_idx           # trough_time
-                )
-
+                    continue  # Skip this accumulation if no left rim found
 
 
                 if peak_c_time is None or pd.isna(peak_c_time):
