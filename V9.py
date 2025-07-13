@@ -122,6 +122,8 @@ class CupHandleDetector:
         # Update config with provided parameters if any
         if config:
             self.config.update(config)
+            self.config.setdefault('enable_formation_first', False)
+        
             print(f"\n🔧 LOADED CONFIG DEBUG:")
         print(f"  rim_height_tolerance_pct: {self.config.get('rim_height_tolerance_pct')}")
         print(f"  use_absolute_rim_tolerance: {self.config.get('use_absolute_rim_tolerance')}")
@@ -130,6 +132,7 @@ class CupHandleDetector:
         print(f"  Custom config passed: {self.config}")
         print(f"🔧 ACTUAL CONFIG: rim_tolerance={self.config['rim_height_tolerance_pct']}, min_depth={self.config['min_cup_depth']}")
         print("-" * 50)
+     
 
         if hasattr(self, 'adaptive_config') and self.adaptive_config:
             # This will be set during detection when we have access to the dataframe
@@ -1243,8 +1246,15 @@ class CupHandleDetector:
         peak_a_price = df.loc[peak_a_time, 'high']
         peak_c_time = actual_peak_c_time 
         peak_c_price = df.loc[peak_c_time, 'high']
+
+
+        rim_diff_abs = abs(peak_a_price - peak_c_price)
+        rim_diff_pct = (rim_diff_abs / max(peak_a_price, peak_c_price)) * 100
+        rim_level = (peak_a_price + peak_c_price) / 2
         
         print(f"   Cup: A=${peak_a_price:.2f} → B=${trough_b_price:.2f} → C=${peak_c_price:.2f}")
+        print(f"   🎯 RIM ANALYSIS: A=${peak_a_price:.2f}, C=${peak_c_price:.2f}, Diff={rim_diff_pct:.2f}%")
+    
         
         # Step 3: Calculate cup metrics
         cup_depth = peak_a_price - trough_b_price
@@ -1295,6 +1305,12 @@ class CupHandleDetector:
             'breakout_e': breakout_time,
             'breakout_threshold': max(peak_a_price, peak_c_price),
             'breakout_confirmed': True,
+            'rim_a_price': peak_a_price,           # Actual left rim price
+            'rim_c_price': peak_c_price,           # Actual right rim price  
+            'rim_level': rim_level,                # Average rim level
+            'rim_diff_abs': rim_diff_abs,          # Absolute price difference
+            'rim_diff_pct': rim_diff_pct,          # Percentage difference
+            'rim_tolerance_used': self.config.get('rim_height_tolerance_pct', 'unknown'),  # What tolerance was used
             'cup_depth': cup_depth,
             'cup_depth_pct': cup_depth_pct,
             'cup_duration_min': cup_duration_hours * 60,
@@ -1355,27 +1371,50 @@ class CupHandleDetector:
         """Find actual valid right rim - must be real peak at end of cup recovery"""
         
         try:
-            # Step 1: Define proper search window (recovery phase of cup)
+            # Step 1: Your existing setup code (UNCHANGED)
             trough_idx = df.index.get_loc(trough_time)
             acc_end_idx = df.index.get_loc(accumulation_end)
             
-            # Search from 75% through recovery to end + buffer
             recovery_start = trough_idx + int((acc_end_idx - trough_idx) * 0.75)
-            search_end = min(len(df), acc_end_idx + 20)  # ← BOUNDS CHECK
+            search_end = min(len(df), acc_end_idx + 20)
             
-            # Ensure valid range
             if recovery_start >= search_end or recovery_start >= len(df):
                 print(f"      ❌ Invalid search range, using accumulation_end")
                 return accumulation_end
             
             search_window = df.iloc[recovery_start:search_end]
-            
-            # Step 2: Only consider ACTUAL PEAKS (extrema=1)
             actual_peaks = search_window[search_window['extrema'] == 1]
             
             if len(actual_peaks) == 0:
                 print(f"      ❌ No actual peaks found in recovery phase, using accumulation_end")
                 return accumulation_end  # ← ALWAYS VALID FALLBACK
+            
+            use_hybrid = getattr(self, 'use_hybrid_detection', False)
+            print(f"\n      🔍 DEBUG HYBRID DETECTION:")
+            print(f"         Hybrid mode enabled: {use_hybrid}")
+            print(f"         Total peaks found: {len(actual_peaks)}")
+        
+            if use_hybrid:
+                print(f"      🔄 Using hybrid detection (ATR + Direct scoring)")
+                
+                # Method 1: ATR filtering (if available)
+                atr_candidates = []
+                has_atr_method = hasattr(self, 'is_significant_peak')
+                print(f"         Has ATR method: {has_atr_method}")
+
+                if hasattr(self, 'is_significant_peak'):
+                    for peak_time, peak_row in actual_peaks.iterrows():
+                        if self.is_significant_peak(df, peak_time, atr_multiplier=1.5):
+                            atr_candidates.append((peak_time, peak_row))
+                    print(f"      📊 ATR Filter: {len(actual_peaks)} → {len(atr_candidates)} significant peaks")
+                
+                # Method 2: Use all peaks if ATR found none, or if ATR not available
+                if not atr_candidates:
+                    atr_candidates = [(peak_time, peak_row) for peak_time, peak_row in actual_peaks.iterrows()]
+                    print(f"      📊 Using all {len(atr_candidates)} peaks (ATR filter not available/found none)")
+            else:
+                # Original behavior - use all peaks
+                atr_candidates = [(peak_time, peak_row) for peak_time, peak_row in actual_peaks.iterrows()]
             
             # Step 3: Filter for ATR-significant peaks only
             significant_peaks = []
@@ -1391,35 +1430,32 @@ class CupHandleDetector:
             
             # Step 3: Score peaks based on multiple criteria
             candidates = []
-            for peak_time, peak_row in actual_peaks.iterrows():
+            for peak_time, peak_row in atr_candidates:  # ← ONLY CHANGE: use atr_candidates instead of actual_peaks.iterrows()
                 peak_price = peak_row['high']
-                total_score = 0 
-                # Price symmetry with left rim (40% weight)
+                
+                # Your existing scoring logic (UNCHANGED)
                 price_diff_pct = abs(peak_price - left_rim_price) / left_rim_price * 100
                 symmetry_score = max(0, 100 - price_diff_pct * 40)
                 
-                # Position in recovery (30% weight) 
                 position_in_recovery = (df.index.get_loc(peak_time) - recovery_start) / (search_end - recovery_start)
                 position_score = position_in_recovery * 100
                 
-                # Peak strength validation (30% weight)
                 peak_idx = df.index.get_loc(peak_time)
-                lookback = min(5, peak_idx)  # ← BOUNDS CHECK
-                lookahead = min(5, len(df) - peak_idx - 1)  # ← BOUNDS CHECK
+                lookback = min(5, peak_idx)
+                lookahead = min(5, len(df) - peak_idx - 1)
                 
                 if lookback > 0 and lookahead > 0:
                     local_window = df.iloc[max(0, peak_idx-lookback):min(len(df), peak_idx+lookahead+1)]
                     is_local_high = peak_price >= local_window['high'].max()
                     strength_score = 100 if is_local_high else 50
                 else:
-                    strength_score = 50  # Default if at boundaries
+                    strength_score = 50
                 
-                # Combined score
-                    total_score = (
-                        0.8 * symmetry_score +   
-                        0.1 * position_score +    
-                        0.1 * strength_score       
-                    )
+                total_score = (
+                    0.8 * symmetry_score +   
+                    0.1 * position_score +    
+                    0.1 * strength_score       
+                )
                 
                 candidates.append({
                     'time': peak_time,
@@ -1429,19 +1465,17 @@ class CupHandleDetector:
                     'is_strong_peak': is_local_high if 'is_local_high' in locals() else False
                 })
             
-            # Step 4: Select best candidate with validation
+            # Rest of your existing code (UNCHANGED)
             if not candidates:
                 print(f"      ❌ No valid candidates, using accumulation_end")
-                return accumulation_end  # ← ALWAYS VALID FALLBACK
+                return accumulation_end
             
             best_candidate = max(candidates, key=lambda x: x['score'])
             
-            # Final validation: Must have decent symmetry (max 5% for robustness)
             if best_candidate['symmetry_pct'] > 5.0:
                 print(f"      ❌ Best candidate has {best_candidate['symmetry_pct']:.1f}% asymmetry, using accumulation_end")
-                return accumulation_end  # ← FALLBACK TO VALID TIMESTAMP
+                return accumulation_end
             
-            # CRITICAL: Ensure return value is valid
             result_time = best_candidate['time']
             if result_time not in df.index:
                 print(f"      ❌ Result time {result_time} not in df.index, using accumulation_end")
@@ -1452,7 +1486,7 @@ class CupHandleDetector:
             
         except Exception as e:
             print(f"      ❌ Error in find_optimal_right_rim: {e}, using accumulation_end")
-            return accumulation_end  # ← ALWAYS VALID FALLBACK
+            return accumulation_end
         
 
     def _score_handle_optimally(self, handle_depth_pct):
@@ -2132,9 +2166,6 @@ class CupHandleDetector:
     def detect(self, df: pd.DataFrame, extrema_col="extrema", price_col="close", return_rejections=False):
         """Main detection function that runs the full pipeline."""
         logger.info("Starting Cup and Handle pattern detection")
-
-     
- 
         print(f"🔧 CONFIG AFTER UPDATE:")
         print(f"   rim_height_tolerance_pct: {self.config.get('rim_height_tolerance_pct')}")
         print(f"   min_handle_drop: {self.config.get('min_handle_drop')}")
@@ -2190,6 +2221,11 @@ class CupHandleDetector:
         # Store rejected pattern info for manual review
      
         patterns, rejection_stats = self.detect_cup_and_handle(processed_df, 'extrema', f"{price_col}_smooth")
+
+        # Add simple formation-first patterns if enabled
+        if self.config.get('enable_formation_first', False):
+            patterns.extend(self._add_formation_patterns(processed_df))
+
         patterns = self.remove_duplicate_patterns(patterns)
         print(f"\n🚨 PATTERN FLOW DEBUG:")
         print(f"   Patterns returned from detect_cup_and_handle: {len(patterns)}")
@@ -2236,6 +2272,188 @@ class CupHandleDetector:
 
 
         return filtered_patterns
+    
+    def detect_combined(self, df: pd.DataFrame, extrema_col="extrema", price_col="close", return_rejections=False):
+        """Main detection function that runs both strict and relaxed versions in parallel."""
+        logger.info("Starting Combined Cup and Handle pattern detection")
+        
+        # Step 1: Shared preprocessing (memory efficient)
+        logger.info("Preprocessing data (shared)")
+        processed_df = self.preprocess_data(df, price_col)
+        self._processed_df = processed_df
+        
+        # Step 2: Shared extrema detection (memory efficient)
+        logger.info("Detecting extrema (shared)")
+        processed_df['extrema'] = self.detect_extrema_multi_scale(processed_df, f"{price_col}_smooth")
+        
+        # Step 3: Run both detection versions
+        logger.info("Running strict version")
+        strict_config = self.get_strict_config()
+        strict_patterns = self._run_detection_with_config(processed_df, strict_config, 'strict', extrema_col, price_col)
+        
+        logger.info("Running relaxed version") 
+        relaxed_config = self.get_relaxed_config()
+        relaxed_patterns = self._run_detection_with_config(processed_df, relaxed_config, 'relaxed', extrema_col, price_col)
+        
+        # Step 4: Combine results with source tags
+        combined_patterns = self.merge_pattern_results(strict_patterns, relaxed_patterns)
+        
+        return combined_patterns
+
+    def get_strict_config(self):
+        """Strict config for higher-quality, longer-term patterns"""
+        return {
+            "min_cup_roundness": 0.4,
+            "cup_symmetry_threshold": 0.2,
+            "prominence": 0.001,
+            "rim_height_tolerance_pct": 1.0,
+            "min_quality_score": 65,           # Higher quality threshold
+            "min_cup_depth": 0.01,            # Deeper cups (1%+)
+            "min_cup_duration": 720,          # Longer cups (12+ hours)
+            "max_handle_depth_pct": 35.0      # Shallower handles
+        }
+
+    def get_relaxed_config(self):
+        """Relaxed config for catching more patterns"""
+        return {
+            "min_cup_roundness": 0.2,
+            "cup_symmetry_threshold": 0.15,
+            "prominence": 0.002,
+            "rim_height_tolerance_pct": 2.0,
+            "min_quality_score": 40,           # Lower threshold
+            "min_cup_depth": 0.005,           # Allow shallower
+            "min_cup_duration": 360,          # Shorter duration ok
+            "max_handle_depth_pct": 45.0      # Allow deeper handles
+        }
+    
+    def _run_detection_with_config(self, processed_df, config_override, source_tag, extrema_col='extrema', price_col='close_smooth'):
+        """Run detection with specific config and tag results with source."""
+        
+        # Backup original config
+        original_config = self.config.copy()
+        
+        try:
+            # Temporarily update config
+            self.config.update(config_override)
+            
+            # Run detection with modified config
+            patterns, rejection_stats = self.detect_cup_and_handle(processed_df, extrema_col, price_col)
+            
+            # Remove duplicates
+            patterns = self.remove_duplicate_patterns(patterns)
+            
+            # Filter patterns
+            filtered_patterns = self.filter_patterns(patterns)
+            
+            # Tag each pattern with source
+            for pattern in filtered_patterns:
+                pattern['detection_source'] = source_tag
+                pattern['config_used'] = config_override.copy()
+            
+            logger.info(f"{source_tag} detection found {len(filtered_patterns)} patterns")
+            return filtered_patterns
+            
+        finally:
+            # Always restore original config
+            self.config = original_config
+
+    def merge_pattern_results(self, strict_patterns, relaxed_patterns):
+        """Merge results from both detection methods with overlap handling."""
+        
+        combined_results = {
+            'strict_patterns': strict_patterns,
+            'relaxed_patterns': relaxed_patterns,
+            'all_patterns': [],
+            'overlap_analysis': {
+                'strict_only': 0,
+                'relaxed_only': 0,
+                'overlapping': 0,
+                'total_unique_periods': 0
+            }
+        }
+        
+        # Simple merge: add all patterns with source tags
+        all_patterns = []
+        
+        # Add strict patterns
+        for pattern in strict_patterns:
+            pattern['pattern_id'] = f"strict_{len(all_patterns)}"
+            all_patterns.append(pattern)
+        
+        # Add relaxed patterns
+        for pattern in relaxed_patterns:
+            pattern['pattern_id'] = f"relaxed_{len(all_patterns)}"
+            all_patterns.append(pattern)
+        
+        # Sort by start time for easier analysis
+        all_patterns.sort(key=lambda x: x['peak_a'])
+        
+        # Basic overlap detection (for statistics)
+        strict_periods = [(p['peak_a'], p['breakout_e']) for p in strict_patterns]
+        relaxed_periods = [(p['peak_a'], p['breakout_e']) for p in relaxed_patterns]
+        
+        # Count overlaps
+        overlaps = 0
+        for s_start, s_end in strict_periods:
+            for r_start, r_end in relaxed_periods:
+                # Check if periods overlap
+                if (s_start <= r_end and s_end >= r_start):
+                    overlaps += 1
+                    break
+        
+        # Update statistics
+        combined_results['overlap_analysis'] = {
+            'strict_only': len(strict_patterns) - overlaps,
+            'relaxed_only': len(relaxed_patterns) - overlaps, 
+            'overlapping': overlaps,
+            'total_patterns': len(all_patterns),
+            'unique_periods': len(strict_patterns) + len(relaxed_patterns) - overlaps
+        }
+        
+        combined_results['all_patterns'] = all_patterns
+        
+        logger.info(f"Combined results: {len(strict_patterns)} strict + {len(relaxed_patterns)} relaxed = {len(all_patterns)} total patterns")
+        logger.info(f"Overlap analysis: {overlaps} overlapping periods detected")
+        
+        return combined_results
+        
+
+    def _add_formation_patterns(self, df):
+        """Simple formation-first detection - just finds A-B-C-D-E sequences"""
+        patterns = []
+        peaks = df[df['extrema'] == 1]
+        troughs = df[df['extrema'] == -1]
+        
+        # Process only first 20 peaks to keep it simple
+        for i, peak_a in enumerate(peaks.index[:20]):
+            if i >= len(peaks) - 2: break
+            
+            peak_c_candidates = peaks[peaks.index > peak_a][:5]  # Next 5 peaks only
+            
+            for peak_c in peak_c_candidates.index:
+                # Find trough between them
+                between_troughs = troughs[(troughs.index > peak_a) & (troughs.index < peak_c)]
+                if len(between_troughs) == 0: continue
+                
+                trough_b = between_troughs.index[0]  # First trough
+                
+                # Quick validation using your existing methods
+                try:
+                    pattern = self.create_institutional_pattern(
+                        {'price': df.loc[peak_c, 'high'], 'touches': 2},
+                        {'start': peak_a, 'end': peak_c, 'score': 50},
+                        {'start': peak_c, 'end': peak_c, 'depth_pct': 1.0, 'score': 50, 'low_price': df.loc[peak_c, 'low']},
+                        peak_c, df, peak_c, 'close_smooth'
+                    )
+                    if pattern:
+                        pattern['detection_method'] = 'formation_first'
+                        patterns.append(pattern)
+                        if len(patterns) >= 10: break  # Limit to 10 additional patterns
+                except:
+                    continue
+        
+        print(f"   📊 Formation-first added: {len(patterns)} patterns")
+        return patterns
 
    
    
@@ -2807,16 +3025,18 @@ class CupHandleDetector:
                 left_peaks = left_peaks[left_peaks['extrema'] == 1]
 
                 if len(left_peaks) > 0:
-                    # Find peak closest to resistance level
+                    # Find HIGHEST peak that's reasonably close to resistance level
                     best_left_rim = None
-                    min_diff = float('inf')
+                    best_left_rim_price = 0  # Start with 0 to find highest
                     
                     for peak_time, peak_row in left_peaks.iterrows():
-                        diff = abs(peak_row['high'] - resistance['price'])
-                        if diff < min_diff:
-                            min_diff = diff
-                            best_left_rim = peak_row['high']
-                            best_left_rim_time = peak_time
+                        peak_price = peak_row['high']
+                        # Must be reasonably close to resistance (within 10% for ES futures)
+                        if abs(peak_price - resistance['price']) / resistance['price'] <= 0.10:
+                            if peak_price > best_left_rim_price:  # Find HIGHEST, not closest
+                                best_left_rim_price = peak_price
+                                best_left_rim = peak_price
+                                best_left_rim_time = peak_time
                     
                     if best_left_rim is not None:
                         peak_a_price = best_left_rim
@@ -2893,6 +3113,69 @@ class CupHandleDetector:
         
         self.print_detection_summary()
         return patterns, rejection_reasons
+    
+    def detect_formation_first(self, df, extrema_col='extrema', price_col='close_smooth'):
+        """
+        Formation-first detection: Add this method after detect_cup_and_handle_deduped
+        """
+        print(f"\n🔍 FORMATION-FIRST DETECTION (complementary to institutional):")
+        
+        patterns = []
+        peaks = df[df[extrema_col] == 1]
+        troughs = df[df[extrema_col] == -1]
+        
+        if len(peaks) < 3 or len(troughs) < 2:
+            print(f"   ❌ Insufficient extrema for formation-first")
+            return []
+        
+        print(f"   📊 Processing {len(peaks)} peaks, {len(troughs)} troughs")
+        
+        # Process in small batches to avoid memory issues
+        batch_size = 30  # Small batches
+        
+        for i, peak_a_time in enumerate(peaks.index[:-2]):  # Need at least 2 more peaks
+            if i >= batch_size:  # Limit total processing
+                print(f"   ⏹️ Stopping at {batch_size} peaks to prevent overload")
+                break
+                
+            peak_a_price = df.loc[peak_a_time, 'high']
+            
+            # Find troughs after this peak (max 5 to keep it manageable)
+            candidate_troughs = troughs[troughs.index > peak_a_time][:5]
+            
+            for trough_b_time in candidate_troughs.index:
+                trough_b_price = df.loc[trough_b_time, 'low']
+                
+                # Find peaks after this trough (max 3 to keep it manageable)
+                candidate_peaks = peaks[peaks.index > trough_b_time][:3]
+                
+                for peak_c_time in candidate_peaks.index:
+                    peak_c_price = df.loc[peak_c_time, 'high']
+                    
+                    # Quick validation before expensive operations
+                    if not self._quick_cup_check(peak_a_price, trough_b_price, peak_c_price, 
+                                                peak_a_time, peak_c_time):
+                        continue
+                    
+                    # Simple handle detection
+                    handle = self._find_formation_handle(df, peak_c_time, peak_c_price)
+                    if not handle:
+                        continue
+                    
+                    # Simple breakout detection
+                    breakout_time = self._find_formation_breakout(df, handle, max(peak_a_price, peak_c_price))
+                    if not breakout_time:
+                        continue
+                    
+                    # Create pattern
+                    pattern = self._create_formation_pattern(df, peak_a_time, trough_b_time, 
+                                                           peak_c_time, handle, breakout_time, price_col)
+                    if pattern:
+                        patterns.append(pattern)
+                        print(f"      ✅ Formation pattern: {peak_a_time.strftime('%m-%d %H:%M')}")
+        
+        print(f"   📊 Formation-first found: {len(patterns)} additional patterns")
+        return patterns
 
     
     def adjust_pattern_points(self, pattern, df, price_col='close_smooth'):
@@ -3173,10 +3456,23 @@ class CupHandleDetector:
         return True, "valid_handle_position"
     
 
+    def is_significant_peak(self, df, peak_time, atr_multiplier=1.5):
+        """Simple ATR significance check"""
+        try:
+            atr_series = self.calculate_atr(df, 20)
+            peak_idx = df.index.get_loc(peak_time)
+            current_atr = atr_series.iloc[peak_idx]
+            peak_price = df.loc[peak_time, 'high']
+            
+            # Simple prominence check
+            window = df.iloc[max(0, peak_idx-5):peak_idx+6]
+            prominence = peak_price - window['low'].min()
+            required = current_atr * atr_multiplier
+            
+            return prominence >= required
+        except:
+            return True  
     
-    
-    
-
     def _validate_formation_geometry(self, df, peak_a_time, trough_b_time, peak_c_time):
         """Basic geometric validation for cup formations."""
         
@@ -3373,6 +3669,7 @@ if __name__ == "__main__":
     "min_cup_depth": 0.003,
     "breakout_max_above_rim_pct": 0.5,
     "disable_deduplication": True,
+    "enable_formation_first": True,
     "min_handle_gap_minutes": 150, 
     "max_handle_depth_pct": 25.0,  # Keep existing max
     "min_handle_depth_pct": 0.05,   # ✅ FIXED: Reduced from 2.0 to 0.3 for ES futures
@@ -3398,7 +3695,9 @@ if __name__ == "__main__":
     "rim_search_duration": 1440,
     "handle_search_duration": 960,
     "max_handle_drop": 25.0,
-    
+    "use_hybrid_detection": True,      
+    "enable_atr_filtering": True,    
+    "atr_multiplier": 1.5,           
     # Keep working settings
     "skip_rim_adjustment": True,
 }
@@ -3409,7 +3708,7 @@ if __name__ == "__main__":
     df.set_index('timestamp', inplace=True)
 
     # 🔥 FILTER: Only last 10 years to avoid massive time gaps
-    cutoff_date = pd.Timestamp.now() - pd.DateOffset(months=12)
+    cutoff_date = pd.Timestamp.now() - pd.DateOffset(months=6)
     original_length = len(df)
     df = df[df.index >= cutoff_date]
     print(f"📅 FILTERED DATA: {original_length} → {len(df)} bars (last 10 years since {cutoff_date.date()})")
@@ -3419,22 +3718,31 @@ if __name__ == "__main__":
     print(f"🔍 ACTUAL CONFIG CHECK: max_gap_bars would be = {90 if detector.detect_timeframe(df) >= 1440 else 30}")
     detector.detect_cup_and_handle_original = detector.detect_cup_and_handle
     detector.detect_cup_and_handle = detector.detect_cup_and_handle_deduped
-    patterns = detector.detect(df)
-    if patterns is None:
-        patterns = []
-    print("⚠️ Detection returned None, using empty pattern list")
-    detector.analyze_breakout_failures()
-    print(f"\n🔍 DIAGNOSIS:")
-    if detector.detection_stats['resistance_levels']['total_found'] == 0:
-        print("❌ No resistance levels found - check price tolerance")
-    elif detector.detection_stats['accumulation_analysis']['valid_accumulations'] == 0:
-        print("❌ No accumulation periods found - constraints too strict")
-    elif detector.detection_stats['handle_analysis']['handles_found'] == 0:
-        print("❌ No handles found - handle criteria too strict")
-    elif detector.detection_stats['pattern_creation']['breakouts_found'] == 0:
-        print("❌ No breakouts found - need more data after handles")
-    else:
-        print("✅ Pipeline working but patterns filtered out")
+    combined_results = detector.detect_combined(df)
+    patterns = combined_results['all_patterns']
+    # Print analysis of both systems
+    print(f"\n🔍 COMBINED DETECTION RESULTS:")
+    print(f"   Strict patterns: {len(combined_results['strict_patterns'])}")
+    print(f"   Relaxed patterns: {len(combined_results['relaxed_patterns'])}")
+    print(f"   Total patterns: {len(combined_results['all_patterns'])}")
+
+    overlap_stats = combined_results['overlap_analysis']
+    print(f"\n📊 OVERLAP ANALYSIS:")
+    print(f"   Strict only: {overlap_stats['strict_only']}")
+    print(f"   Relaxed only: {overlap_stats['relaxed_only']}")
+    print(f"   Overlapping: {overlap_stats['overlapping']}")
+    print(f"   Unique periods: {overlap_stats['unique_periods']}")
+
+    # Show breakdown by source
+    print(f"\n🏷️  PATTERN SOURCE BREAKDOWN:")
+    for pattern in patterns[:10]:  # Show first 10
+        source = pattern.get('detection_source', 'unknown')
+        quality = pattern.get('quality_score', 0)
+        pattern_id = pattern.get('pattern_id', 'no_id')
+        print(f"   {pattern_id}: {source} (quality: {quality:.1f})")
+
+    if len(patterns) == 0:
+        print("⚠️ No patterns found from either system")
 
     # Count pattern types for verification
     v_shapes = [p for p in patterns if p.get('cup_roundness', 0) < 0.7]
